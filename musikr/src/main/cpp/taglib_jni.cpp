@@ -139,56 +139,6 @@ bool parseWav(const std::string &name, TagLib::RIFF::WAV::File *wavFile,
     return true;
 }
 
-// A minimal implementation of 'detectByContent()' from TagLib,
-// limited to the available 'parse..()' functions available here.
-// This fixes mostly all parsing problems for formats undetected by
-// simple extension based detection, like AAC-in-MP4, but still
-// doesn't work for Matroska, as it is not yet supported by TagLib
-// see https://github.com/taglib/taglib/pull/1149
-// Detects the file type based on the actual content of the stream.
-TagLib::File* createFileFromContent(TagLib::IOStream *stream,
-        bool readAudioProperties,
-        TagLib::AudioProperties::ReadStyle audioPropertiesStyle) {
-    TagLib::File *file = nullptr;
-
-    if (TagLib::MPEG::File::isSupported(stream))
-        file = new TagLib::MPEG::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-    else if (TagLib::Ogg::Vorbis::File::isSupported(stream))
-        file = new TagLib::Ogg::Vorbis::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-    else if (TagLib::FLAC::File::isSupported(stream))
-        file = new TagLib::FLAC::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-    else if (TagLib::Ogg::Opus::File::isSupported(stream))
-        file = new TagLib::Ogg::Opus::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-    else if (TagLib::MP4::File::isSupported(stream))
-        file = new TagLib::MP4::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-    else if (TagLib::RIFF::WAV::File::isSupported(stream))
-        file = new TagLib::RIFF::WAV::File(stream, readAudioProperties,
-                audioPropertiesStyle);
-
-    // double-check that the potentially created file actually valid.
-    if (file) {
-        if (file->isValid())
-            return file;
-        delete file;
-    }
-
-    return nullptr;
-}
-
-// This dispatcher replaces the previous, order-dependent if-else chain. It uses
-// dynamic_cast to identify the file's true type, ensuring the correct parser is
-// always called. This also allows the 'parse..()' functions to be simplified by
-// accepting a specific file type (e.g., 'MPEG::File*'), removing the need for
-// redundant internal checks.
-// Accurate container MIME type support is not added, as it did not seem
-// necessary, we can rely on SAF and MediaStore implementation for now,
-// that works on extension based detection, so we expect users to use
-// correct file extensions.
 bool dispatchAndParse(const std::string &name, TagLib::File *file,
         JMetadataBuilder &jBuilder) {
     if (auto *mpegFile = dynamic_cast<TagLib::MPEG::File*>(file)) {
@@ -271,53 +221,31 @@ Java_org_oxycblt_musikr_metadata_TagLibJNI_openNative(JNIEnv *env,
         jobject /* this */,
         jobject inputStream) {
     std::string name = "unknown file";
-    TagLib::File *overriddenFile = nullptr;
     try {
         JInputStream jStream {env, inputStream};
         name = jStream.name();
         TagLib::FileRef fileRef {&jStream, true, TagLib::AudioProperties::Average};
-        TagLib::File *fileToUse = fileRef.file();
-        bool needsOverride = (fileToUse != nullptr &&
-                fileToUse->audioProperties() != nullptr &&
-                fileToUse->audioProperties()->lengthInSeconds() == 0);
-        if (needsOverride) {
-            LOGD("FileRef result for %s is suspicious (duration=0). Forcing content scan.", name.c_str());
-            jStream.seek(0, TagLib::IOStream::Beginning);
-            overriddenFile = createFileFromContent(&jStream, true, TagLib::AudioProperties::Average);
-            if (overriddenFile != nullptr &&
-                    overriddenFile->audioProperties() != nullptr &&
-                    overriddenFile->audioProperties()->lengthInSeconds() > 0)
-            {
-                LOGD("Content scan successful. Overriding FileRef result for %s.", name.c_str());
-                fileToUse = overriddenFile;
-            } else {
-                delete overriddenFile;
-                overriddenFile = nullptr;
-            }
-        }
-        if (fileToUse == nullptr) {
-            delete overriddenFile;
+        TagLib::File *file = fileRef.file();
+
+        if (file == nullptr) {
             return metadataResultNotAudio(env);
         }
-        if (fileToUse->audioProperties() == nullptr) {
+        if (file->audioProperties() == nullptr) {
             LOGE("No audio properties for %s", name.c_str());
-            delete overriddenFile;
             return metadataResultNoMetadata(env);
         }
         JMetadataBuilder jBuilder {env};
-        jBuilder.setProperties(fileToUse->audioProperties());
+        jBuilder.setProperties(file->audioProperties());
 
-        if (!dispatchAndParse(name, fileToUse, jBuilder)) {
+        if (!dispatchAndParse(name, file, jBuilder)) {
             LOGE("File format in %s is not supported by any parser.", name.c_str());
-            delete overriddenFile;
             return metadataResultNotAudio(env);
         }
+
         JObjectRef jMetadata {env, jBuilder.build()};
-        delete overriddenFile;
         return metadataResultSuccess(env, *jMetadata);
     } catch (std::exception &e) {
         LOGE("Unable to parse metadata in %s: %s", name.c_str(), e.what());
-        delete overriddenFile;
         return metadataResultProviderFailed(env);
     }
 }
